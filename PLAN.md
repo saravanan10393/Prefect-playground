@@ -6,10 +6,11 @@ A QnA agent built with **Pydantic AI** (agent framework) + **Prefect 3.0** (dura
 The agent answers user questions by routing through 4 tools, each wrapped as a Prefect task
 with independent retry/timeout/caching policies.
 
-**Streaming-only mode:** All LLM calls use streaming (`run_stream()`) because most providers
-default to streaming and may error on non-streaming requests. Prefect tasks still consume the
-full stream for caching/durability, but the underlying HTTP calls to the LLM provider use
-streaming — solving provider compatibility while preserving durable execution.
+**Streaming-only mode:** All LLM calls use streaming because most providers default to streaming
+and may error on non-streaming requests. `PrefectAgent` does **not** support `run_stream()` directly.
+Instead, use `PrefectAgent.run()` with an **`event_stream_handler`** callback — or the convenience
+method `run_stream_events()` — to receive real-time streaming events while preserving durable execution.
+Each event is automatically wrapped as a Prefect task for durability.
 
 ---
 
@@ -132,7 +133,7 @@ class QnAResponse(BaseModel):
     confidence: float           # 0.0 - 1.0
 ```
 
-### 2. Agent Definition (`agent.py`) — Streaming-Only
+### 2. Agent Definition (`agent.py`) — Streaming via event_stream_handler
 
 ```python
 from pydantic_ai import Agent
@@ -156,9 +157,11 @@ qa_agent = Agent(
 # Register tools on the agent (imported from tools.py)
 # ... tools are decorated with @qa_agent.tool
 
-# Wrap for durable execution (streaming-only mode)
-# All LLM calls use streaming HTTP — required by most providers.
-# Use prefect_qa_agent.run_stream() exclusively (never .run()).
+# Wrap for durable execution (streaming mode)
+# PrefectAgent does NOT support run_stream(). Instead:
+#   - Use .run(event_stream_handler=handler) for streaming events
+#   - Or use .run_stream_events() convenience method
+# All LLM calls use streaming HTTP under the hood.
 prefect_qa_agent = PrefectAgent(
     qa_agent,
     model_task_config=TaskConfig(
@@ -174,12 +177,17 @@ prefect_qa_agent = PrefectAgent(
                                          retry_delay_seconds=[1.0, 2.0, 4.0]),
         'summarize_answer':   None,  # disable — pure LLM, no external I/O
     },
+    # Configure how event stream handler tasks behave inside the Prefect flow
+    event_stream_handler_task_config=TaskConfig(retries=1),
 )
 ```
 
-> **Why streaming-only?** Most LLM providers (OpenAI, Anthropic, etc.) default to streaming
-> and some throw errors on non-streaming requests. By exclusively using `run_stream()`,
-> every model request uses streaming HTTP under the hood, ensuring compatibility across providers.
+> **Why not `run_stream()`?** `PrefectAgent` wraps `Agent.run()` and `Agent.run_sync()` as
+> Prefect flows — but **not** `run_stream()`. For streaming, Pydantic AI provides the
+> `event_stream_handler` pattern: pass a callback to `.run()` that receives events
+> (`PartStartEvent`, `PartDeltaEvent`, `FunctionToolCallEvent`, etc.) as they stream in.
+> Inside a Prefect flow, each event is wrapped as a task for durability. Do **not** manually
+> decorate event stream handlers with `@task` — PrefectAgent handles this automatically.
 
 ### 3. Tool Implementations (`tools.py`)
 
@@ -219,10 +227,21 @@ def summarize_answer(findings: list[str]) -> str:
 
 ### 4. Entry Point (`scripts/run_agent.py`) — Streaming Mode
 
+**Option A: `event_stream_handler` callback (recommended for real-time output)**
+
 ```python
 import asyncio
+from pydantic_ai import RunContext
+from pydantic_ai.agent import AgentStreamEvent, PartDeltaEvent, TextPartDelta
 from qa_agent.agent import prefect_qa_agent
 from qa_agent.models import QnADeps
+
+async def stream_to_stdout(ctx: RunContext[QnADeps], events) -> None:
+    """Event stream handler — prints text deltas as they arrive."""
+    async for event in events:
+        if isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
+            print(event.delta.content, end="", flush=True)
+    print()  # final newline
 
 async def main():
     deps = QnADeps(
@@ -231,53 +250,68 @@ async def main():
         web_search_api_key="...",
     )
 
-    # Use run_stream() — all LLM calls use streaming HTTP under the hood.
-    # Prefect tasks still consume the full stream for caching/durability,
-    # but the provider-level calls are streamed (required by most providers).
-    async with prefect_qa_agent.run_stream(
+    # PrefectAgent.run() with event_stream_handler for streaming.
+    # Under the hood, all LLM calls use streaming HTTP.
+    # Each event is wrapped as a Prefect task for durability.
+    result = await prefect_qa_agent.run(
         "What is durable execution in Prefect?",
         deps=deps,
-    ) as stream:
-        # Stream tokens to stdout as they arrive
-        async for chunk in stream.stream_text():
-            print(chunk, end="", flush=True)
-        print()  # final newline
-
-    # Access the final structured result after streaming completes
-    result = stream.result
-    print(f"\nSources: {result.output.sources}")
+        event_stream_handler=stream_to_stdout,
+    )
+    print(f"\nAnswer: {result.output.answer}")
+    print(f"Sources: {result.output.sources}")
     print(f"Confidence: {result.output.confidence}")
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-> **Note on Prefect + Streaming:** Inside Prefect tasks, each model request task
-> consumes the full stream before returning (so the result can be cached for durability).
-> However, the HTTP calls to the LLM provider still use streaming, which is what matters
-> for provider compatibility. At the top-level flow, `run_stream()` provides real-time
-> token streaming to the caller.
+**Option B: `run_stream_events()` convenience method**
+
+```python
+async def main():
+    deps = QnADeps(...)
+
+    # Convenience wrapper around run(event_stream_handler=...)
+    # Returns an async iterable of AgentStreamEvents + final AgentRunResultEvent
+    async for event in prefect_qa_agent.run_stream_events(
+        "What is durable execution in Prefect?",
+        deps=deps,
+    ):
+        if isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
+            print(event.delta.content, end="", flush=True)
+        elif isinstance(event, AgentRunResultEvent):
+            result = event.result
+            print(f"\nSources: {result.output.sources}")
+```
+
+> **How streaming works with Prefect durability:**
+> - `PrefectAgent.run()` uses streaming HTTP for all LLM calls (provider compatibility)
+> - The `event_stream_handler` receives events in real-time as they stream from the model
+> - Inside a Prefect flow, each event handler invocation is wrapped as a Prefect task
+> - Do **not** manually decorate handlers with `@task` — PrefectAgent does this automatically
+> - On retry, completed tasks are skipped (cached), so you don't re-pay for finished LLM calls
 
 ---
 
 ## Durable Execution: What Happens on Failure?
 
 ```
-Run 1 (fails at step 3) — streaming mode:
-  ✅ LLM stream #1 → tool decision       (stream consumed, result cached)
-  ✅ search_local_files("prefect")        (cached)
+Run 1 (fails at step 3) — streaming via event_stream_handler:
+  ✅ LLM model_task #1 → tool decision    (streamed, events emitted, result cached)
+  ✅ search_local_files("prefect")         (cached)
   ❌ search_web("prefect durable") → TIMEOUT
 
 Run 2 (retry — resumes from failure):
-  ⏭️  LLM stream #1 → skipped (cached result reused, no re-stream)
+  ⏭️  LLM model_task #1 → skipped (cached result reused)
   ⏭️  search_local_files → skipped (cached result reused)
   ✅ search_web("prefect durable") → SUCCESS (retried)
-  ✅ LLM stream #2 → synthesize answer (streamed, result cached)
+  ✅ LLM model_task #2 → synthesize (streamed, events emitted, result cached)
   ✅ Output: QnAResponse(...)
 ```
 
-This is the core value: **Run 2 doesn't re-pay for LLM stream #1 or the local file search.**
-Streaming ensures provider compatibility; caching ensures cost savings on retry.
+This is the core value: **Run 2 doesn't re-pay for LLM model_task #1 or the local file search.**
+Streaming ensures provider compatibility; Prefect task caching ensures cost savings on retry.
 
 ---
 
