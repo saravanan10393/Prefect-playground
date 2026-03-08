@@ -6,6 +6,11 @@ A QnA agent built with **Pydantic AI** (agent framework) + **Prefect 3.0** (dura
 The agent answers user questions by routing through 4 tools, each wrapped as a Prefect task
 with independent retry/timeout/caching policies.
 
+**Streaming-only mode:** All LLM calls use streaming (`run_stream()`) because most providers
+default to streaming and may error on non-streaming requests. Prefect tasks still consume the
+full stream for caching/durability, but the underlying HTTP calls to the LLM provider use
+streaming — solving provider compatibility while preserving durable execution.
+
 ---
 
 ## Architecture Diagram
@@ -127,7 +132,7 @@ class QnAResponse(BaseModel):
     confidence: float           # 0.0 - 1.0
 ```
 
-### 2. Agent Definition (`agent.py`)
+### 2. Agent Definition (`agent.py`) — Streaming-Only
 
 ```python
 from pydantic_ai import Agent
@@ -151,7 +156,9 @@ qa_agent = Agent(
 # Register tools on the agent (imported from tools.py)
 # ... tools are decorated with @qa_agent.tool
 
-# Wrap for durable execution
+# Wrap for durable execution (streaming-only mode)
+# All LLM calls use streaming HTTP — required by most providers.
+# Use prefect_qa_agent.run_stream() exclusively (never .run()).
 prefect_qa_agent = PrefectAgent(
     qa_agent,
     model_task_config=TaskConfig(
@@ -169,6 +176,10 @@ prefect_qa_agent = PrefectAgent(
     },
 )
 ```
+
+> **Why streaming-only?** Most LLM providers (OpenAI, Anthropic, etc.) default to streaming
+> and some throw errors on non-streaming requests. By exclusively using `run_stream()`,
+> every model request uses streaming HTTP under the hood, ensuring compatibility across providers.
 
 ### 3. Tool Implementations (`tools.py`)
 
@@ -206,7 +217,7 @@ def summarize_answer(findings: list[str]) -> str:
     ...
 ```
 
-### 4. Entry Point (`scripts/run_agent.py`)
+### 4. Entry Point (`scripts/run_agent.py`) — Streaming Mode
 
 ```python
 import asyncio
@@ -219,35 +230,54 @@ async def main():
         db_path="./qa.db",
         web_search_api_key="...",
     )
-    result = await prefect_qa_agent.run(
+
+    # Use run_stream() — all LLM calls use streaming HTTP under the hood.
+    # Prefect tasks still consume the full stream for caching/durability,
+    # but the provider-level calls are streamed (required by most providers).
+    async with prefect_qa_agent.run_stream(
         "What is durable execution in Prefect?",
         deps=deps,
-    )
-    print(result.output)
+    ) as stream:
+        # Stream tokens to stdout as they arrive
+        async for chunk in stream.stream_text():
+            print(chunk, end="", flush=True)
+        print()  # final newline
+
+    # Access the final structured result after streaming completes
+    result = stream.result
+    print(f"\nSources: {result.output.sources}")
+    print(f"Confidence: {result.output.confidence}")
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
+
+> **Note on Prefect + Streaming:** Inside Prefect tasks, each model request task
+> consumes the full stream before returning (so the result can be cached for durability).
+> However, the HTTP calls to the LLM provider still use streaming, which is what matters
+> for provider compatibility. At the top-level flow, `run_stream()` provides real-time
+> token streaming to the caller.
 
 ---
 
 ## Durable Execution: What Happens on Failure?
 
 ```
-Run 1 (fails at step 3):
-  ✅ LLM call #1 → tool decision         (cached)
+Run 1 (fails at step 3) — streaming mode:
+  ✅ LLM stream #1 → tool decision       (stream consumed, result cached)
   ✅ search_local_files("prefect")        (cached)
   ❌ search_web("prefect durable") → TIMEOUT
 
 Run 2 (retry — resumes from failure):
-  ⏭️  LLM call #1 → skipped (cached result reused)
+  ⏭️  LLM stream #1 → skipped (cached result reused, no re-stream)
   ⏭️  search_local_files → skipped (cached result reused)
   ✅ search_web("prefect durable") → SUCCESS (retried)
-  ✅ LLM call #2 → synthesize answer
+  ✅ LLM stream #2 → synthesize answer (streamed, result cached)
   ✅ Output: QnAResponse(...)
 ```
 
-This is the core value: **Run 2 doesn't re-pay for LLM call #1 or the local file search.**
+This is the core value: **Run 2 doesn't re-pay for LLM stream #1 or the local file search.**
+Streaming ensures provider compatibility; caching ensures cost savings on retry.
 
 ---
 
